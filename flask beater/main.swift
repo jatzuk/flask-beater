@@ -11,6 +11,8 @@ enum Color: String, CaseIterable, Hashable {
   case red = "RD"
   case lightGreen = "LG"
   case gray = "GY"
+  case magenta = "MG"
+  case turquoise = "TQ"
 
   static let maxPiecesPerColor = 4
 
@@ -302,6 +304,46 @@ func findMatchableColors(_ state: State) -> [(Color, Int, Int)] {
   return matches
 }
 
+func isUsefulMove(_ state: State, from: Int, to: Int) -> Bool {
+  let source = state.flasks[from]
+  let target = state.flasks[to]
+
+  if target.emptyPieceCount == Flask.capacity {
+    guard let topIdx = source.topIndex(),
+          case let .color(color) = source.pieces[topIdx] else { return false }
+
+    var count = 1
+    var cursor = topIdx - 1
+    while cursor >= 0 {
+      if case let .color(c) = source.pieces[cursor], c == color {
+        count += 1
+        cursor -= 1
+      } else { break }
+    }
+
+    return count == topIdx + 1 || count == Flask.capacity
+  }
+
+  return true
+}
+
+func heuristic(_ state: State) -> Int {
+  var score = 0
+
+  for flask in state.flasks {
+    if flask.isLocked { score -= 100 }
+  }
+
+  for flask in state.flasks {
+    let colors = Set(flask.pieces.compactMap { $0.color })
+    score += colors.count * 10
+  }
+
+  score -= state.flasks.reduce(0) { $0 + $1.emptyPieceCount }
+
+  return score
+}
+
 func simpleGreedySolve(state: State, path: [Action] = [], visited: inout Set<String>) -> [Action]? {
   if isSolved(state) { return path }
 
@@ -340,25 +382,227 @@ func simpleGreedySolve(state: State, path: [Action] = [], visited: inout Set<Str
   return nil
 }
 
-func adaptiveInteractiveSolve(state: State) {
+// MARK: - Parallel BFS Solver
+struct SearchNode: Comparable {
+  let state: State
+  let path: [Action]
+  let depth: Int
+  let score: Int
+
+  static func < (lhs: SearchNode, rhs: SearchNode) -> Bool {
+    lhs.score < rhs.score
+  }
+
+  static func == (lhs: SearchNode, rhs: SearchNode) -> Bool {
+    lhs.score == rhs.score
+  }
+}
+
+func parallelBFSSolve(state: State, maxDepth: Int = 100, beamWidth: Int = 300_000) -> [Action]? {
+  let queue = DispatchQueue(label: "solver.queue", attributes: .concurrent)
+  let visitedQueue = DispatchQueue(label: "solver.visited")
+  let resultQueue = DispatchQueue(label: "solver.result")
+
+  var visited = Set<String>()
+  var solutionFound: [Action]? = nil
+
+  visited.insert(canonicalKey(for: state))
+
+  var currentLevel = [SearchNode(state: state, path: [], depth: 0, score: heuristic(state))]
+  var nodesExplored = 0
+
+  for depth in 0...maxDepth {
+    guard solutionFound == nil else { break }
+    guard !currentLevel.isEmpty else { break }
+
+    print("Exploring depth \(depth), nodes: \(currentLevel.count), visited: \(visited.count)")
+
+    var nextLevel: [[SearchNode]] = Array(repeating: [], count: currentLevel.count)
+    let group = DispatchGroup()
+
+    for (index, node) in currentLevel.enumerated() {
+      group.enter()
+      queue.async {
+        defer { group.leave() }
+
+        resultQueue.sync {
+          if solutionFound != nil { return }
+        }
+
+        if isSolved(node.state) {
+          resultQueue.sync {
+            if solutionFound == nil || node.path.count < solutionFound!.count {
+              solutionFound = node.path
+            }
+          }
+          return
+        }
+
+        var localNextNodes: [SearchNode] = []
+
+        var topHiddenFlask: (Int, Int)? = nil
+        for (flaskIdx, flask) in node.state.flasks.enumerated() {
+          if let topIdx = flask.topIndex(), case .hidden = flask.pieces[topIdx] {
+            topHiddenFlask = (flaskIdx, topIdx)
+            break
+          }
+        }
+
+        if let (flaskIdx, _) = topHiddenFlask {
+          let usage = colorUsage(in: node.state)
+          let availableColors = Color.allCases.filter { usage[$0, default: 0] < Color.maxPiecesPerColor }
+
+          for color in availableColors {
+            if let nextState = apply(.reveal(flaskIndex: flaskIdx, color: color), to: node.state) {
+              let key = canonicalKey(for: nextState)
+              var shouldAdd = false
+
+              visitedQueue.sync {
+                if !visited.contains(key) {
+                  visited.insert(key)
+                  shouldAdd = true
+                }
+              }
+
+              if shouldAdd {
+                let newNode = SearchNode(
+                  state: nextState,
+                  path: node.path + [.reveal(flaskIndex: flaskIdx, color: color)],
+                  depth: depth + 1,
+                  score: heuristic(nextState)
+                )
+                localNextNodes.append(newNode)
+              }
+            }
+          }
+        } else {
+          let matches = findMatchableColors(node.state)
+
+          if matches.isEmpty {
+            for (flaskIdx, flask) in node.state.flasks.enumerated() {
+              let hasHidden = flask.pieces.contains { piece in
+                if case .hidden = piece { return true }
+                return false
+              }
+
+              if hasHidden, let topIdx = flask.topIndex(), case .hidden = flask.pieces[topIdx] {
+                let usage = colorUsage(in: node.state)
+                let availableColors = Color.allCases.filter { usage[$0, default: 0] < Color.maxPiecesPerColor }
+
+                for color in availableColors {
+                  if let nextState = apply(.reveal(flaskIndex: flaskIdx, color: color), to: node.state) {
+                    let key = canonicalKey(for: nextState)
+                    var shouldAdd = false
+
+                    visitedQueue.sync {
+                      if !visited.contains(key) {
+                        visited.insert(key)
+                        shouldAdd = true
+                      }
+                    }
+
+                    if shouldAdd {
+                      let newNode = SearchNode(
+                        state: nextState,
+                        path: node.path + [.reveal(flaskIndex: flaskIdx, color: color)],
+                        depth: depth + 1,
+                        score: heuristic(nextState)
+                      )
+                      localNextNodes.append(newNode)
+                    }
+                  }
+                }
+                break
+              }
+            }
+          } else {
+            for (_, from, to) in matches {
+              // prune useless moves (but be less aggressive initially)
+              if !isUsefulMove(node.state, from: from, to: to) {
+                // allow moves to empty flasks if still exploring (depth < 100)
+                if depth >= 100 || node.state.flasks[to].emptyPieceCount != Flask.capacity {
+                  continue
+                }
+              }
+
+              if let (nextState, move) = applyPour(state: node.state, from: from, to: to) {
+                let key = canonicalKey(for: nextState)
+                var shouldAdd = false
+
+                visitedQueue.sync {
+                  if !visited.contains(key) {
+                    visited.insert(key)
+                    shouldAdd = true
+                  }
+                }
+
+                if shouldAdd {
+                  let newNode = SearchNode(
+                    state: nextState,
+                    path: node.path + [.pour(move)],
+                    depth: depth + 1,
+                    score: heuristic(nextState)
+                  )
+                  localNextNodes.append(newNode)
+                }
+              }
+            }
+          }
+        }
+
+        nextLevel[index] = localNextNodes
+      }
+    }
+
+    group.wait()
+
+    // flatten next level and apply beam search pruning
+    currentLevel = nextLevel.flatMap { $0 }
+    nodesExplored += currentLevel.count
+
+    if currentLevel.isEmpty && solutionFound == nil {
+      print("⚠️ No more nodes to explore at depth \(depth)")
+    }
+
+    if currentLevel.count > beamWidth {
+      currentLevel.sort()
+      currentLevel = Array(currentLevel.prefix(beamWidth))
+    }
+
+    if solutionFound != nil {
+      print("✅ Solution found at depth \(depth)!")
+      break
+    }
+  }
+
+  return solutionFound
+}
+
+func adaptiveInteractiveSolve(state: State, useParallel: Bool = true) {
   print("=== ADAPTIVE INTERACTIVE SOLVER ===")
+  print("Using \(useParallel ? "parallel" : "sequential") solver")
 
   func solveUntilReveal(state: State, stepOffset: Int) -> (State, [Action], Int)? {
     print("Searching for solution from current state")
-    var visited: Set<String> = []
 
-    if let solution = simpleGreedySolve(state: state, path: [], visited: &visited) {
+    let solution: [Action]?
+    if useParallel {
+      solution = parallelBFSSolve(state: state)
+    } else {
+      var visited: Set<String> = []
+      solution = simpleGreedySolve(state: state, path: [], visited: &visited)
+    }
+
+    if let solution = solution {
       var currentState = state
       var executedMoves: [Action] = []
       var currentStep = stepOffset
 
       for action in solution {
         if case .reveal = action {
-          // stop before the reveal and return current state
           return (currentState, executedMoves, currentStep)
         }
 
-        // Execute pour move
         if let nextState = apply(action, to: currentState) {
           currentStep += 1
           print("Step \(currentStep): \(action.description)")
@@ -371,7 +615,6 @@ func adaptiveInteractiveSolve(state: State) {
         }
       }
 
-      // Finished all moves without hitting a reveal
       return (currentState, executedMoves, currentStep)
     } else {
       print("❌ Could not find solution from current state.")
@@ -445,13 +688,11 @@ func adaptiveInteractiveSolve(state: State) {
             continue
           }
 
-          // Check if this color is still available
           if !availableColors.contains(revealedColor) {
             print("Color \(revealedColor.symbol) is already used 4 times. Available colors: \(colorList)")
             continue
           }
 
-          // Apply the reveal
           let revealAction = Action.reveal(flaskIndex: index, color: revealedColor)
           if let nextState = apply(revealAction, to: currentState) {
             currentState = nextState
@@ -477,25 +718,46 @@ func adaptiveInteractiveSolve(state: State) {
   }
 }
 
-func solve(state: State) -> [Action]? {
-  var visited: Set<String> = []
-  return simpleGreedySolve(state: state, visited: &visited)
+func solve(state: State, useParallel: Bool = true) -> [Action]? {
+  if useParallel {
+    return parallelBFSSolve(state: state)
+  } else {
+    var visited: Set<String> = []
+    return simpleGreedySolve(state: state, visited: &visited)
+  }
 }
 
 // MARK: - Puzzle bootstrap
-let initialState = State(flasks: [
-  Flask([.color(.red), .color(.beige), .color(.pink), .color(.darkGreen)]),
-  Flask([.hidden(id: 0), .color(.darkBlue), .color(.brown), .color(.lightBlue)]),
-  Flask([.color(.lightBlue), .color(.darkBlue), .color(.orange), .color(.lightBlue)]),
-  Flask([.color(.red), .color(.lightGreen), .color(.pink), .color(.brown)]),
-  Flask([.color(.beige), .color(.darkGreen), .color(.red), .color(.beige)]),
-  Flask([.color(.lightGreen), .color(.gray), .color(.lightBlue), .color(.darkBlue)]),
-  Flask([.color(.lightGreen), .color(.gray), .color(.darkBlue), .color(.darkGreen)]),
-  Flask([.color(.gray), .color(.red), .color(.orange), .color(.brown)]),
-  Flask([.color(.darkGreen), .color(.lightGreen), .color(.orange), .color(.pink)]),
-  Flask([.color(.beige), .color(.pink), .color(.orange), .color(.brown)]),
+//let initialState = State(flasks: [
+//  Flask([.color(.red), .color(.beige), .color(.pink), .color(.darkGreen)]),
+//  Flask([.hidden(id: 0), .color(.darkBlue), .color(.brown), .color(.lightBlue)]),
+//  Flask([.color(.lightBlue), .color(.darkBlue), .color(.orange), .color(.lightBlue)]),
+//  Flask([.color(.red), .color(.lightGreen), .color(.pink), .color(.brown)]),
+//  Flask([.color(.beige), .color(.darkGreen), .color(.red), .color(.beige)]),
+//  Flask([.color(.lightGreen), .color(.gray), .color(.lightBlue), .color(.darkBlue)]),
+//  Flask([.color(.lightGreen), .color(.gray), .color(.darkBlue), .color(.darkGreen)]),
+//  Flask([.color(.gray), .color(.red), .color(.orange), .color(.brown)]),
+//  Flask([.color(.darkGreen), .color(.lightGreen), .color(.orange), .color(.pink)]),
+//  Flask([.color(.beige), .color(.pink), .color(.orange), .color(.brown)]),
+//  Flask([.empty, .empty, .empty, .empty]),
+//  Flask([.empty, .empty, .empty, .empty])
+//])
+
+let initialState  = State(flasks:  [
+  Flask([.hidden(id: 0), .color(.orange), .color(.darkGreen), .color(.red)]),
+  Flask([.color(.turquoise), .color(.lightGreen), .color(.darkBlue), .color(.brown)]),
+  Flask([.hidden(id: 1), .color(.pink), .color(.lightBlue), .color(.gray)]),
+  Flask([.hidden(id: 2), .color(.darkBlue), .color(.gray), .color(.beige)]),
+  Flask([.hidden(id: 3), .hidden(id: 4), .color(.gray), .color(.orange)]),
+  Flask([.color(.turquoise), .color(.red), .color(.lightGreen), .color(.orange)]),
+  Flask([.color(.beige), .color(.red), .color(.brown), .color(.darkBlue)]),
+  Flask([.hidden(id: 5), .hidden(id: 6), .color(.darkGreen), .color(.beige)]),
+  Flask([.color(.turquoise), .color(.red), .color(.darkGreen), .color(.brown)]),
+  Flask([.color(.lightGreen), .color(.orange), .color(.lightGreen), .color(.magenta)]),
+  Flask([.color(.pink), .color(.lightBlue), .color(.darkGreen), .color(.magenta)]),
+  Flask([.color(.pink), .color(.lightBlue), .color(.brown), .color(.magenta)]),
   Flask([.empty, .empty, .empty, .empty]),
-  Flask([.empty, .empty, .empty, .empty])
+  Flask([.empty, .empty, .empty, .empty]),
 ])
 
 print("Initial state:")
